@@ -1,130 +1,138 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
+	"flag"
 	"log"
-	"net"
-	"strconv"
-	"strings"
+	"net/http"
+	"sync"
 	"time"
 
-	"github.com/sanity-io/litter"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+const Namespace = "keba"
+
+var (
+	voltage = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: Namespace,
+		Name:      "voltage",
+		Help:      "Voltage of the 3 phases in volts",
+	}, []string{"phase"})
+
+	current = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: Namespace,
+		Name:      "current",
+		Help:      "Current of the 3 phases in ampere",
+	}, []string{"phase"})
+	currentLimit = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: Namespace,
+		Name:      "current_limit",
+		Help:      "Maximum amperes permitted",
+	}, []string{"kind"})
+
+	power = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: Namespace,
+		Name:      "power",
+		Help:      "Power draw in watts",
+	})
+
+	whTotal     F
+	whSession   F
+	energyTotal = promauto.NewCounterFunc(prometheus.CounterOpts{
+		Namespace: Namespace,
+		Name:      "energy_total_wh",
+		Help:      "Total energy supplied by the wallbox in Wh",
+	}, whTotal.Get)
+	energySession = promauto.NewCounterFunc(prometheus.CounterOpts{
+		Namespace: Namespace,
+		Name:      "energy_session_wh",
+		Help:      "Energy supplied by the wallbox during this charging session in Wh",
+	}, whSession.Get)
+	energySessionLimit = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: Namespace,
+		Name:      "energy_total_limit",
+		Help:      "Maximum energy to be supplied in this charging session",
+	})
 )
 
 func main() {
 	log.SetFlags(0)
+	flag.Parse()
 
 	udp, err := newUDP("172.21.10.102")
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	var r1 Report1
-	if err := udp.msg("report 1", &r1); err != nil {
-		log.Fatalln(err)
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		if err := http.ListenAndServe(":2112", nil); err != nil {
+			log.Fatalln(err)
+		}
+	}()
+
+	ticker := time.NewTicker(10 * time.Second)
+	for ; true; <-ticker.C {
+		cfg, err := udp.Config()
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		sess, err := udp.Session()
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		// voltages
+		gauge(voltage, "1").Set(float64(sess.Voltage1))
+		gauge(voltage, "2").Set(float64(sess.Voltage2))
+		gauge(voltage, "3").Set(float64(sess.Voltage3))
+
+		// currents
+		gauge(current, "1").Set(float64(sess.Current1) / 1000)
+		gauge(current, "2").Set(float64(sess.Current2) / 1000)
+		gauge(current, "3").Set(float64(sess.Current3) / 1000)
+
+		gauge(currentLimit, "hw").Set(float64(cfg.MaxCurrent) / 1000)
+		gauge(currentLimit, "user").Set(float64(cfg.CurrentLimit) / 1000)
+
+		// power
+		power.Set(float64(sess.Power) / 1000)
+
+		// energy
+		whTotal.Set(float64(sess.Total) / 1000)
+		whSession.Set(float64(sess.Energy) / 1000)
 	}
-
-	litter.Dump(r1)
 }
 
-type Report1 struct {
-	ID int `json:"ID,string"`
-
-	Product  string `json:"Product"`
-	Serial   string `json:"Serial"`
-	Firmware string `json:"Firmware"`
-
-	COMModule int `json:"COM-module"`
-	Backend   int `json:"Backend"`
-
-	DIPs DIPs `json:"DIP-Sw"`
-}
-
-const (
-	dip1 = 1 << 16
-	dip2 = 1 << 8
-
-	DIP_Modbus = dip1 >> 2
-	DIP_UDP    = dip1 >> 3
-)
-
-type DIPs uint16
-
-func (d DIPs) Has(i uint16) bool {
-	return uint16(d)&i != 0
-}
-
-func (d *DIPs) UnmarshalJSON(data []byte) error {
-	var s string
-	if err := json.Unmarshal(data, &s); err != nil {
-		return err
-	}
-
-	i, err := strconv.ParseInt(strings.TrimPrefix(s, "0x"), 16, 16)
+func gauge(vec *prometheus.GaugeVec, lvs ...string) prometheus.Gauge {
+	g, err := vec.GetMetricWithLabelValues(lvs...)
 	if err != nil {
-		return err
+		panic(err)
 	}
-
-	*d = DIPs(i)
-	return nil
+	return g
 }
 
-func (d *DIPs) MarshalJSON() ([]byte, error) {
-	return []byte(d.String()), nil
+// F is a concurrency safe float
+type F struct {
+	val float64
+	mu  sync.RWMutex
 }
 
-func (d *DIPs) String() string {
-	return fmt.Sprintf("0x%x", uint16(*d))
+func (f *F) Set(v float64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.val = v
 }
 
-type client interface {
-	msg(cmd string, ptr interface{}) error
-}
+func (f *F) Get() float64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 
-const port = 7090
-
-func newUDP(addr string) (*udp, error) {
-	var udp udp
-	udp.addr.Port = port
-
-	if ip := net.ParseIP(addr); ip != nil {
-		udp.addr.IP = ip
-		return &udp, nil
-	}
-
-	ips, err := net.LookupIP(addr)
-	if err != nil {
-		return nil, err
-	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("no dns records found for '%s'", addr)
-	}
-	udp.addr.IP = ips[0]
-
-	return &udp, nil
-}
-
-type udp struct {
-	addr net.UDPAddr
-}
-
-func (u *udp) msg(cmd string, ptr interface{}) error {
-	raddr := &u.addr
-	laddr := &net.UDPAddr{Port: raddr.Port}
-	laddr.IP = nil
-
-	conn, err := net.DialUDP("udp", laddr, raddr)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if _, err := conn.Write([]byte(cmd)); err != nil {
-		return err
-	}
-
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-
-	return json.NewDecoder(conn).Decode(&ptr)
+	return f.val
 }
