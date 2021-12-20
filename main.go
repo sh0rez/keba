@@ -54,7 +54,7 @@ var (
 	}, whSession.Get)
 	energySessionLimit = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: Namespace,
-		Name:      "energy_total_limit",
+		Name:      "energy_session_limit",
 		Help:      "Maximum energy to be supplied in this charging session",
 	})
 )
