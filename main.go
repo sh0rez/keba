@@ -2,8 +2,10 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -57,32 +59,60 @@ var (
 	})
 )
 
+var (
+	udpTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: Namespace,
+		Subsystem: "scrape",
+		Name:      "total",
+	})
+
+	udpErrs = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: Namespace,
+		Subsystem: "scrape",
+		Name:      "errors",
+	})
+)
+
 func main() {
-	log.SetFlags(0)
+	addr := flag.String("http", ":2112", "http address to bind to")
 	flag.Parse()
 
-	udp, err := newUDP("172.21.10.102")
+	if flag.NArg() != 1 {
+		fmt.Println("Error: Requires exactly 1 argument")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	udp, err := newUDP(flag.Arg(0))
 	if err != nil {
 		log.Fatalln(err)
 	}
 
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
-		if err := http.ListenAndServe(":2112", nil); err != nil {
+		log.Printf("http: listening on %s", *addr)
+		if err := http.ListenAndServe(*addr, nil); err != nil {
 			log.Fatalln(err)
 		}
 	}()
 
 	ticker := time.NewTicker(10 * time.Second)
 	for ; true; <-ticker.C {
+		udpTotal.Inc()
 		cfg, err := udp.Config()
-		if err != nil {
+		if err == nil {
+			gauge(currentLimit, "hw").Set(float64(cfg.MaxCurrent) / 1000)
+			gauge(currentLimit, "user").Set(float64(cfg.CurrentLimit) / 1000)
+		} else {
+			udpErrs.Inc()
 			log.Println(err)
 			continue
 		}
 
+		udpTotal.Inc()
 		sess, err := udp.Session()
 		if err != nil {
+			udpErrs.Inc()
 			log.Println(err)
 			continue
 		}
@@ -96,9 +126,6 @@ func main() {
 		gauge(current, "1").Set(float64(sess.Current1) / 1000)
 		gauge(current, "2").Set(float64(sess.Current2) / 1000)
 		gauge(current, "3").Set(float64(sess.Current3) / 1000)
-
-		gauge(currentLimit, "hw").Set(float64(cfg.MaxCurrent) / 1000)
-		gauge(currentLimit, "user").Set(float64(cfg.CurrentLimit) / 1000)
 
 		// power
 		power.Set(float64(sess.Power) / 1000)
