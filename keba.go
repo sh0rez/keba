@@ -244,6 +244,9 @@ func (u *udp) History() ([]Log, error) {
 		if l.Session == 0 {
 			continue
 		}
+		if len(hist) > 0 && l.Session == hist[len(hist)-1].Session {
+			continue
+		}
 
 		hist = append(hist, Log(l))
 	}
