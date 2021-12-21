@@ -83,6 +83,28 @@ type Session struct {
 }
 
 type Log struct {
+	Session int
+
+	MaxCurrent int
+
+	// Energies before and during the session
+	StartTotal int
+	Energy     int
+
+	// Start and End seconds of the internal clock
+	Start int
+	End   int
+
+	// Reason for the session to end
+	EndReason int
+
+	// RFID auth info
+	RFIDTag   string
+	RFIDClass string
+}
+
+// udpLog is like Log, but holds the respective JSON tags for unmarshalling
+type udpLog struct {
 	Session int `json:"Session ID"`
 
 	MaxCurrent int `json:"Curr HW"`
@@ -90,13 +112,36 @@ type Log struct {
 	StartTotal int `json:"E Start"`
 	Energy     int `json:"E Pres"`
 
-	// Start int `json:"started[s]"`
-	// End   int `json:"ended[s]"`
+	Start int
+	End   int
 
 	EndReason int `json:"reason"`
 
 	RFIDTag   string `json:"RFID tag"`
 	RFIDClass string `json:"RFID class"`
+}
+
+func (l *udpLog) UnmarshalJSON(data []byte) error {
+	type T *udpLog
+	if err := json.Unmarshal(data, T(l)); err != nil {
+		return err
+	}
+
+	var times struct {
+		Start json.Number `json:"started[s]"`
+		End   json.Number `json:"ended[s]"`
+	}
+	if err := json.Unmarshal(data, &times); err != nil {
+		return err
+	}
+
+	if i, err := times.Start.Int64(); err == nil {
+		l.Start = int(i)
+	}
+	if i, err := times.End.Int64(); err == nil {
+		l.End = int(i)
+	}
+	return nil
 }
 
 const Port = 7090
@@ -187,7 +232,7 @@ func (u *udp) Session() (*Session, error) {
 func (u *udp) History() ([]Log, error) {
 	hist := make([]Log, 0, 30)
 	for i := 100; i <= 130; i++ {
-		var l Log
+		var l udpLog
 		cmd := fmt.Sprintf("report %d", i)
 		if err := u.msg(cmd, &l); err != nil {
 			return nil, err
@@ -200,7 +245,7 @@ func (u *udp) History() ([]Log, error) {
 			continue
 		}
 
-		hist = append(hist, l)
+		hist = append(hist, Log(l))
 	}
 
 	return hist, nil
