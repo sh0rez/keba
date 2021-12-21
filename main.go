@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -57,6 +58,17 @@ var (
 		Name:      "energy_session_limit",
 		Help:      "Maximum energy to be supplied in this charging session",
 	})
+
+	status = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: Namespace,
+		Name:      "status",
+		Help:      "State of the charging station (Starting, NotReady, Ready, Charging, Error, AuthRejected)",
+	})
+	plugStatus = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: Namespace,
+		Name:      "plug_status",
+		Help:      "Status of the plug (cable)",
+	}, []string{"kind"})
 )
 
 var (
@@ -88,25 +100,37 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-		log.Printf("http: listening on %s", *addr)
-		if err := http.ListenAndServe(*addr, nil); err != nil {
-			log.Fatalln(err)
-		}
-	}()
+	go metrics(udp)
+	go history(udp)
+
+	log.Printf("http: listening on %s", *addr)
+	if err := http.ListenAndServe(*addr, nil); err != nil {
+		log.Fatalln(err)
+	}
+}
+
+func metrics(udp Client) {
+	http.Handle("/metrics", promhttp.Handler())
 
 	ticker := time.NewTicker(10 * time.Second)
 	for ; true; <-ticker.C {
 		udpTotal.Inc()
 		cfg, err := udp.Config()
 		if err == nil {
+			// current limits
 			gauge(currentLimit, "hw").Set(float64(cfg.MaxCurrent) / 1000)
 			gauge(currentLimit, "user").Set(float64(cfg.CurrentLimit) / 1000)
+
+			// device status
+			status.Set(float64(cfg.State))
+
+			// plug status
+			gauge(plugStatus, "station").Set(btof(cfg.Plug&PlugStation != 0))
+			gauge(plugStatus, "locked").Set(btof(cfg.Plug&PlugLocked != 0))
+			gauge(plugStatus, "ev").Set(btof(cfg.Plug&PlugEV != 0))
 		} else {
 			udpErrs.Inc()
 			log.Println(err)
-			continue
 		}
 
 		udpTotal.Inc()
@@ -131,8 +155,38 @@ func main() {
 		power.Set(float64(sess.Power) / 1000)
 
 		// energy
-		whTotal.Set(float64(sess.Total) / 1000)
-		whSession.Set(float64(sess.Energy) / 1000)
+		whTotal.Set(float64(sess.Total) / 10)
+		whSession.Set(float64(sess.Energy) / 10)
+	}
+}
+
+func history(udp Client) {
+	var hist []Log
+	var mu sync.RWMutex
+
+	http.HandleFunc("/history", func(w http.ResponseWriter, r *http.Request) {
+		mu.RLock()
+		defer mu.RUnlock()
+
+		data, err := json.Marshal(hist)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Write(data)
+	})
+
+	ticker := time.NewTicker(10 * time.Second)
+	for ; true; <-ticker.C {
+		h, err := udp.History()
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+		mu.Lock()
+		hist = h
+		mu.Unlock()
 	}
 }
 
@@ -162,4 +216,11 @@ func (f *F) Get() float64 {
 	defer f.mu.RUnlock()
 
 	return f.val
+}
+
+func btof(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }

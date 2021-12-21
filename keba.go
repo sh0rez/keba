@@ -20,6 +20,12 @@ const (
 )
 
 const (
+	PlugStation = 0b001
+	PlugLocked  = 0b010
+	PlugEV      = 0b100
+)
+
+const (
 	ReasonUnplug = 1
 	ReasonRFID   = 10
 )
@@ -59,8 +65,8 @@ type Config struct {
 }
 
 type Session struct {
-	Energy int `json:"E pres"`  // mWh
-	Total  int `json:"E total"` // mWh
+	Energy int `json:"E pres"`  // 0.1Wh
+	Total  int `json:"E total"` // 0.1Wh
 
 	// volts
 	Voltage1 int `json:"U1"`
